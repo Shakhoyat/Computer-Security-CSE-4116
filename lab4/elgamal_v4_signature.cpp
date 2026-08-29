@@ -1,268 +1,162 @@
-// ElGamal cryptosystem, file 4: digital signature (sign with D, verify with E1,E2,p).
-//   1 sign / verify, and the algebra that makes V1 == V2
-//   2 raw M vs hashed H(M), and why M >= p-1 silently collides
-//   3 tampered message, tampered signature, wrong public key
-//   4 R reused on two messages -> the private key D falls out. No factoring needed.
-//   5 existential forgery when nobody hashes: valid (M, S1, S2) with no key at all
-//   6 the rules on R: fresh, secret, and coprime to p-1
-// Naming follows the theory sheet:
-//   p prime | D private key | E1 primitive root | E2 = E1^D mod p
-//   signature = (S1, S2)   verification values = (V1, V2)
-// Sign   : S1 = E1^R mod p,  S2 = (M - D*S1) * R^-1 mod (p-1)
-// Verify : V1 = E1^M mod p,  V2 = E2^S1 * S1^S2 mod p,  accept iff V1 == V2
-// Build: g++ -O2 -std=c++17 -o eg4 elgamal_v4_signature.cpp   Run: ./eg4 [seed]
+// ElGamal Digital Signature - sign with the private key D, verify with the
+// public key (E1, E2, p).
+//
+//   Sign   (Alice) : pick R with gcd(R, p-1) = 1
+//                    S1 = E1^R mod p
+//                    S2 = (M - D*S1) * R^-1 mod (p-1)
+//                    send (M, S1, S2)
+//   Verify (Bob)   : V1 = E1^M mod p
+//                    V2 = (E2^S1 * S1^S2) mod p
+//                    signature is valid  <=>  V1 == V2
+//
+//   Note : S1 and S2 use DIFFERENT moduli. S1 is mod p , S2 is mod (p-1).
+//          Mixing the two up is the classic mistake.
+//
+// build : g++ -O2 -o eg4 elgamal_v4_signature.cpp        run : ./eg4
 #include <bits/stdc++.h>
 using namespace std;
+typedef __int128 i128;
 
-// ---------- 128-bit modular core (identical in every lab4 file) ----------
-typedef unsigned long long u64;
-typedef unsigned __int128  u128;
-typedef __int128           i128;
-
-string toStr(u128 x) {
-    if (!x) return "0";
+ostream& operator<<(ostream& os, i128 x) {          // cout does not know __int128
+    if (x == 0) return os << '0';
     string s;
-    while (x) { s += char('0' + int(x % 10)); x /= 10; }
+    while (x > 0) { s += char('0' + (int)(x % 10)); x /= 10; }
     reverse(s.begin(), s.end());
-    return s;
+    return os << s;
 }
-ostream &operator<<(ostream &os, u128 x) { return os << toStr(x); }
-int digitCount(u128 x) { return (int)toStr(x).size(); }
-
-u128 mulmod(u128 a, u128 b, u128 m) {          // a*b would overflow u128 once p > 64 bits
-    a %= m; b %= m; u128 r = 0;
-    while (b) { if (b & 1) { r += a; if (r >= m) r -= m; } a <<= 1; if (a >= m) a -= m; b >>= 1; }
+i128 mod_pow(i128 a, i128 e, i128 m) {              // a^e mod m
+    i128 r = 1; a %= m;
+    while (e > 0) { if (e & 1) r = r * a % m; a = a * a % m; e >>= 1; }
     return r;
 }
-u128 powmod(u128 a, u128 e, u128 m) {
-    u128 r = 1; a %= m;
-    while (e) { if (e & 1) r = mulmod(r, a, m); a = mulmod(a, a, m); e >>= 1; }
-    return r;
-}
-u128 submod(u128 a, u128 b, u128 m) { a %= m; b %= m; return (a + m - b) % m; }   // a-b, no negatives
-u128 gcdu(u128 a, u128 b) { while (b) { u128 t = a % b; a = b; b = t; } return a; }
+i128 gcd128(i128 a, i128 b) { while (b) { i128 t = a % b; a = b; b = t; } return a; }
 i128 egcd(i128 a, i128 b, i128 &x, i128 &y) {
-    if (!b) { x = 1; y = 0; return a; }
+    if (b == 0) { x = 1; y = 0; return a; }
     i128 x1, y1, g = egcd(b, a % b, x1, y1);
     x = y1; y = x1 - (a / b) * y1;
     return g;
 }
-u128 inverse(u128 a, u128 m) {
-    i128 x, y; egcd((i128)(a % m), (i128)m, x, y);
-    i128 r = x % (i128)m;
-    return (u128)(r < 0 ? r + (i128)m : r);
-}
-// a*x = b (mod n) when gcd(a,n) may be > 1: needed by the R-reuse attack, because
-// p-1 is even so half the coefficients we hit are not invertible mod p-1.
-vector<u128> solveLinear(u128 a, u128 b, u128 n, u128 cap = 64) {
-    a %= n; b %= n;
-    u128 g = gcdu(a, n);
-    if (b % g || g > cap) return {};                    // no solution, or too many to enumerate
-    u128 nn = n / g, x0 = mulmod(inverse(a / g, nn), (b / g) % nn, nn);
-    vector<u128> out;
-    for (u128 k = 0; k < g; k++) out.push_back(x0 + k * nn);
-    return out;
+i128 mod_inv(i128 a, i128 m) {                      // a^-1 mod m
+    i128 x, y; egcd(a % m, m, x, y);
+    return (x % m + m) % m;
 }
 
-u64 rngState;
-u64 nextRand() {
-    u64 z = (rngState += 0x9E3779B97F4A7C15ULL);
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
-    return z ^ (z >> 31);
-}
-u128 rand128() { return ((u128)nextRand() << 64) | nextRand(); }
-u128 randRange(u128 lo, u128 hi) { return lo + rand128() % (hi - lo + 1); }
-
-bool isPrime(u128 n) {
+// ---------------- KEY GENERATION HELPERS ----------------
+mt19937_64 rng;
+i128 rand_range(i128 lo, i128 hi) { return lo + (i128)(rng() % (unsigned long long)(hi - lo + 1)); }
+bool is_prime(i128 n) {                             // Miller-Rabin, exact below 3*10^24
     if (n < 2) return false;
-    for (u64 d = 2; d < 1000; d += (d == 2 ? 1 : 2))
-        if (n % d == 0) return n == d;
-    u128 d = n - 1; int r = 0;
-    while (!(d & 1)) { d >>= 1; r++; }
-    auto composite = [&](u128 a) {
-        u128 x = powmod(a, d, n);
-        if (x == 1 || x == n - 1) return false;
-        for (int i = 1; i < r; i++) { x = mulmod(x, x, n); if (x == n - 1) return false; }
-        return true;
-    };
-    for (u64 a : {2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37}) if (composite(a)) return false;
-    for (int i = 0; i < 8; i++) if (composite(randRange(2, n - 2))) return false;
+    for (i128 q : {2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37})
+        if (n % q == 0) return n == q;
+    i128 d = n - 1; int r = 0;
+    while (d % 2 == 0) { d /= 2; r++; }
+    for (i128 a : {2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37}) {
+        i128 x = mod_pow(a, d, n);
+        if (x == 1 || x == n - 1) continue;
+        bool composite = true;
+        for (int i = 1; i < r; i++) { x = x * x % n; if (x == n - 1) { composite = false; break; } }
+        if (composite) return false;
+    }
     return true;
 }
-u128 randBits(int bits) {
-    u128 x = rand128() & ((((u128)1) << bits) - 1);
-    return x | (((u128)1) << (bits - 1)) | 1;
+i128 next_safe_prime(i128 start) {                  // p = 2q+1 with q prime too
+    i128 p = start | 1;
+    while (!(is_prime(p) && is_prime((p - 1) / 2))) p += 2;
+    return p;
 }
-u128 safePrime(int bits) {
-    while (true) {
-        u128 q = randBits(bits - 1);
-        if (!isPrime(q)) continue;
-        u128 p = 2 * q + 1;
-        if (isPrime(p)) return p;
-    }
+i128 find_primitive_root(i128 p) {                  // smallest g of full order p-1
+    i128 q = (p - 1) / 2;
+    for (i128 g = 2; ; g++)
+        if (mod_pow(g, 2, p) != 1 && mod_pow(g, q, p) != 1) return g;
 }
-u128 primitiveRoot(u128 p, u128 q) {
-    for (u128 g = 2;; g++)
-        if (powmod(g, 2, p) != 1 && powmod(g, q, p) != 1) return g;
+i128 pick_R(i128 p) {                               // signing needs R^-1 mod (p-1)
+    i128 n = p - 1, R = rand_range(2, n - 1) | 1;   // so R must be odd
+    while (gcd128(R, n) != 1) { R += 2; if (R >= n) R = 3; }
+    return R;
 }
-
-// ---------- ElGamal signature, named as on the theory sheet ----------
-struct Key { u128 p, D, E1, E2, q; };
-struct Sig  { u128 S1, S2; };
-
-Key keyGen(int bits) {
-    Key K;
-    K.p  = safePrime(bits);
-    K.q  = (K.p - 1) / 2;
-    K.E1 = primitiveRoot(K.p, K.q);
-    K.D  = randRange(2, K.p - 3);
-    K.E2 = powmod(K.E1, K.D, K.p);
-    return K;
-}
-// R must be invertible mod p-1, so gcd(R, p-1) = 1. p-1 = 2q, so R must be odd
-// and must not be a multiple of q.
-u128 pickR(const Key &K) {
-    while (true) { u128 R = randRange(2, K.p - 3); if (gcdu(R, K.p - 1) == 1) return R; }
-}
-Sig sign(u128 M, u128 R, const Key &K) {
-    u128 n = K.p - 1;
-    Sig S;
-    S.S1 = powmod(K.E1, R, K.p);                                    // S1 = E1^R mod p
-    S.S2 = mulmod(submod(M, mulmod(K.D, S.S1, n), n), inverse(R, n), n);  // S2 = (M - D*S1)/R
-    return S;
-}
-bool verify(u128 M, const Sig &S, u128 E1, u128 E2, u128 p) {
-    if (S.S1 == 0 || S.S1 >= p) return false;                       // range check, else forgeable
-    u128 V1 = powmod(E1, M, p);                                     // V1 = E1^M mod p
-    u128 V2 = mulmod(powmod(E2, S.S1, p), powmod(S.S1, S.S2, p), p);// V2 = E2^S1 * S1^S2 mod p
-    return V1 == V2;
-}
-// toy hash (FNV-1a folded into Z_(p-1)) standing in for SHA-256. The algebra is
-// the same either way; only the strength of the hash changes.
-u128 H(const string &s, u128 p) {
-    u64 h = 1469598103934665603ULL;
-    for (unsigned char c : s) { h ^= c; h *= 1099511628211ULL; }
-    u128 r = (u128)h % (p - 1);
-    return r ? r : 1;
-}
-
-// ---------- tiny test harness ----------
-int passed = 0, failed = 0;
-void check(const string &what, bool ok, bool expect = true) {
-    bool pass = (ok == expect);
-    pass ? passed++ : failed++;
-    cout << "    [" << (pass ? "OK  " : "FAIL") << "] " << what;
-    if (!pass) cout << "  (expected " << (expect ? "valid" : "invalid") << ")";
-    cout << "\n";
-}
-void summary() { cout << "\n==== " << passed << " passed, " << failed << " failed ====\n"; }
 
 int main(int argc, char **argv) {
-    rngState = (argc > 1) ? strtoull(argv[1], 0, 10) : 20260829ULL;
-    u64 seed = rngState;
+    // ---------------- INPUT ----------------
+    unsigned long long SEED = 2026;    // different seed -> different key pair
+    i128 M = 111111;                   // message (a hash digest in real life), M < p-1
+    if (argc > 1) SEED = strtoull(argv[1], 0, 10);   // ./eg1 2103021 -> your own key
+    rng.seed(SEED);
 
-    cout << "[1] KEYS (seed " << seed << ")\n";
-    Key K = keyGen(100), Other = keyGen(100);
-    cout << "    p  = " << K.p << "   (" << digitCount(K.p) << " digits)\n";
-    cout << "    public (E1, E2, p) = (" << K.E1 << ", " << K.E2 << ", " << K.p << ")\n";
-    cout << "    private D = " << K.D << "\n";
-    check("E2 = E1^D mod p", powmod(K.E1, K.D, K.p) == K.E2);
+    cout << "==================== KEY GENERATION (Alice) ====================\n";
+    i128 p  = next_safe_prime(rand_range((i128)100000000000000000, (i128)900000000000000000));
+    i128 n  = p - 1;                                // signatures live mod p-1
+    i128 q  = n / 2;
+    i128 D  = rand_range(2, p - 2);
+    i128 E1 = find_primitive_root(p);
+    i128 E2 = mod_pow(E1, D, p);
+    cout << "Step 1 : p  = " << p << "   prime? " << (is_prime(p) ? "yes" : "no") << "\n";
+    cout << "         q  = (p-1)/2 = " << q << "   prime? " << (is_prime(q) ? "yes" : "no")
+         << "   -> safe prime\n";
+    cout << "Step 2 : D  = " << D << "   (private key)\n";
+    cout << "Step 3 : E1 = " << E1 << "   primitive root, since E1^q mod p = "
+         << mod_pow(E1, q, p) << " != 1\n";
+    cout << "Step 4 : E2 = E1^D mod p = " << E2 << "\n";
+    cout << "Step 5 : public (E1, E2, p) = (" << E1 << ", " << E2 << ", " << p << ")\n";
+    cout << "         private D = " << D << "     p-1 = " << n << "\n";
 
-    cout << "\n[2] SIGN AND VERIFY\n";
-    string msg = "Ashik111: pay 100 to account 42";
-    u128 M = H(msg, K.p), R = pickR(K);
-    Sig S = sign(M, R, K);
-    cout << "    H(M) = " << M << "\n    R    = " << R << "\n";
-    cout << "    S1 = E1^R mod p            = " << S.S1 << "\n";
-    cout << "    S2 = (M - D*S1)*R^-1 mod p-1 = " << S.S2 << "\n";
-    cout << "    V1 = " << powmod(K.E1, M, K.p) << "\n";
-    cout << "    V2 = " << mulmod(powmod(K.E2, S.S1, K.p), powmod(S.S1, S.S2, K.p), K.p) << "\n";
-    check("signature verifies", verify(M, S, K.E1, K.E2, K.p));
-    // why: R*S2 + D*S1 = M (mod p-1), so E1^(R*S2) * E1^(D*S1) = E1^M,
-    // i.e. S1^S2 * E2^S1 = E1^M. That is exactly V2 == V1.
-    check("R*S2 + D*S1 = M  (mod p-1)",
-          (mulmod(R, S.S2, K.p - 1) + mulmod(K.D, S.S1, K.p - 1)) % (K.p - 1) == M % (K.p - 1));
-    check("gcd(R, p-1) = 1, so R^-1 exists mod p-1", gcdu(R, K.p - 1) == 1);
+    cout << "\n==================== SIGNING (Alice) ====================\n";
+    cout << "Step 1 : message  M = " << M << "\n";
+    i128 R = pick_R(p);
+    cout << "Step 2 : random   R = " << R << "\n";
+    cout << "         gcd(R, p-1) = " << gcd128(R, n) << "   (must be 1 so R^-1 exists)\n";
 
-    cout << "\n[3] RAW M vs HASHED H(M)\n";
-    u128 raw = 0;
-    for (unsigned char c : msg) raw = raw * 256 + c;
-    raw %= (K.p - 1);
-    check("a raw packed message signs and verifies too", verify(raw, sign(raw, pickR(K), K), K.E1, K.E2, K.p));
-    // but the exponent E1^M only ever sees M mod (p-1), so M and M+(p-1) are the
-    // same message as far as the maths is concerned
-    check("M + (p-1) is accepted by the signature on M",
-          verify(raw + (K.p - 1), sign(raw, pickR(K), K), K.E1, K.E2, K.p));
-    string longMsg = msg + string(500, 'x');
-    check("hashing lets a 500-byte message fit the scheme",
-          verify(H(longMsg, K.p), sign(H(longMsg, K.p), pickR(K), K), K.E1, K.E2, K.p));
+    i128 S1 = mod_pow(E1, R, p);                             // S1 = E1^R mod p
+    cout << "Step 3 : S1 = E1^R mod p\n";
+    cout << "            = " << E1 << "^" << R << " mod " << p << "\n";
+    cout << "            = " << S1 << "\n";
 
-    cout << "\n[4] TAMPERING\n";
-    string t1 = msg; t1.back() = '3';                   // account 42 -> 43
-    check("one character changed in the message", verify(H(t1, K.p), S, K.E1, K.E2, K.p), false);
-    check("S1 bumped by 1", verify(M, {S.S1 + 1, S.S2}, K.E1, K.E2, K.p), false);
-    check("S2 bumped by 1", verify(M, {S.S1, S.S2 + 1}, K.E1, K.E2, K.p), false);
-    check("S1 and S2 swapped", verify(M, {S.S2, S.S1}, K.E1, K.E2, K.p), false);
-    check("checked against somebody else's public key",
-          verify(M, S, Other.E1, Other.E2, Other.p), false);
-    check("S1 = 0 rejected by the range check", verify(M, {0, S.S2}, K.E1, K.E2, K.p), false);
+    i128 DS1 = D % n * (S1 % n) % n;                         // D*S1 mod (p-1)
+    i128 top = ((M - DS1) % n + n) % n;                      // (M - D*S1) mod (p-1)
+    i128 Rin = mod_inv(R, n);                                // R^-1 mod (p-1)
+    i128 S2  = top * Rin % n;                                // S2 = (M - D*S1)*R^-1
+    cout << "Step 4 : S2 = (M - D*S1) * R^-1 mod (p-1)\n";
+    cout << "         D*S1 mod (p-1)       = " << DS1 << "\n";
+    cout << "         (M - D*S1) mod (p-1) = " << top << "\n";
+    cout << "         R^-1 mod (p-1)       = " << Rin << "\n";
+    cout << "         S2 = (" << top << " * " << Rin << ") mod " << n << "\n";
+    cout << "            = " << S2 << "\n";
+    cout << "Step 5 : signature (S1, S2) = (" << S1 << ", " << S2 << ")\n";
 
-    cout << "\n[5] R REUSED ON TWO MESSAGES -> PRIVATE KEY RECOVERED\n";
-    // Alice signs two different messages but forgets to draw a fresh R.
-    u128 Rbad = pickR(K);
-    u128 Ma = H("transfer 100 to Bob", K.p), Mb = H("transfer 999 to Eve", K.p);
-    Sig Sa = sign(Ma, Rbad, K), Sb = sign(Mb, Rbad, K);
-    cout << "    same R used twice, so S1 is identical in both: " << (Sa.S1 == Sb.S1 ? "yes" : "no") << "\n";
-    check("Eve spots the repeat straight from the two signatures", Sa.S1 == Sb.S1);
-    // S2a - S2b = (Ma - Mb) * R^-1  (mod p-1)   ->  R = (Ma - Mb) * (S2a - S2b)^-1
-    u128 n = K.p - 1;
-    u128 foundR = 0, foundD = 0;
-    for (u128 cand : solveLinear(submod(Sa.S2, Sb.S2, n), submod(Ma, Mb, n), n))
-        if (powmod(K.E1, cand, K.p) == Sa.S1) foundR = cand;        // confirm against S1
-    cout << "    recovered R = " << foundR << "\n";
-    check("Eve recovers the nonce R", foundR == Rbad);
-    // then D*S1 = Ma - R*S2a  (mod p-1)  ->  D
-    for (u128 cand : solveLinear(Sa.S1, submod(Ma, mulmod(foundR, Sa.S2, n), n), n))
-        if (powmod(K.E1, cand, K.p) == K.E2) foundD = cand;         // confirm against E2
-    cout << "    recovered D = " << foundD << "\n    actual    D = " << K.D << "\n";
-    check("Eve recovers the private key D", foundD == K.D);
-    Sig forged = sign(H("transfer 1000000 to Eve", K.p), pickR(K), { K.p, foundD, K.E1, K.E2, K.q });
-    check("Eve now signs anything she likes",
-          verify(H("transfer 1000000 to Eve", K.p), forged, K.E1, K.E2, K.p));
-    // exactly the bug that broke the PS3 (ECDSA, same nonce every time)
+    cout << "\n==================== VERIFYING (Bob) ====================\n";
+    i128 V1 = mod_pow(E1, M, p);                             // V1 = E1^M mod p
+    cout << "Step 1 : V1 = E1^M mod p = " << E1 << "^" << M << " mod " << p << "\n";
+    cout << "            = " << V1 << "\n";
 
-    cout << "\n[6] EXISTENTIAL FORGERY WHEN NOBODY HASHES\n";
-    // Eve has only (E1, E2, p). She cannot pick the message, but she can produce
-    // SOME message plus a signature that verifies:
-    //   S1 = E1^a * E2^b,  S2 = -S1*b^-1 mod p-1,  M = a*S2 mod p-1
-    u128 a = randRange(2, n - 1), b;
-    do { b = randRange(2, n - 1); } while (gcdu(b, n) != 1);
-    u128 fS1 = mulmod(powmod(K.E1, a, K.p), powmod(K.E2, b, K.p), K.p);
-    u128 fS2 = mulmod(submod(0, fS1, n), inverse(b, n), n);
-    u128 fM  = mulmod(a, fS2, n);
-    cout << "    forged M  = " << fM << "\n    forged S1 = " << fS1 << "\n    forged S2 = " << fS2 << "\n";
-    check("a forged triple verifies against Alice's public key",
-          verify(fM, {fS1, fS2}, K.E1, K.E2, K.p));
-    check("but Eve did not choose fM -- it fell out of a and b", fM == mulmod(a, fS2, n));
-    // the fix: verifiers must check a signature on H(M), and Eve would have to
-    // find a message hashing to fM -- a preimage, which SHA-256 does not give her
-    check("no readable message is known to hash to fM", H(msg, K.p) == fM, false);
+    i128 x = mod_pow(E2, S1, p), y = mod_pow(S1, S2, p);
+    i128 V2 = x * y % p;                                     // V2 = E2^S1 * S1^S2 mod p
+    cout << "Step 2 : V2 = (E2^S1 * S1^S2) mod p\n";
+    cout << "         E2^S1 mod p = " << x << "\n";
+    cout << "         S1^S2 mod p = " << y << "\n";
+    cout << "         V2 = " << V2 << "\n";
+    cout << "Step 3 : V1 == V2 ?  " << (V1 == V2 ? "YES -> SIGNATURE VALID\n"
+                                                 : "NO -> SIGNATURE INVALID\n");
 
-    cout << "\n[7] THE RULES ON R\n";
-    u128 Reven = 2 * randRange(2, K.q - 1);          // p-1 = 2q, so every even R shares the 2
-    check("an even R is illegal: gcd(R, p-1) = 2, so R^-1 mod p-1 does not exist",
-          gcdu(Reven, K.p - 1) == 1, false);
-    check("pickR() only ever hands back a coprime R", gcdu(pickR(K), K.p - 1) == 1);
-    u128 Rgood = pickR(K);
-    check("a fresh R gives a different S1 each time", sign(M, Rgood, K).S1 == S.S1, false);
-    check("...and both signatures verify", verify(M, sign(M, Rgood, K), K.E1, K.E2, K.p));
-    // and R must stay secret: given R, D = (M - R*S2) * S1^-1 mod (p-1), one line
-    u128 leaked = 0;
-    for (u128 cand : solveLinear(S.S1, submod(M, mulmod(R, S.S2, n), n), n))
-        if (powmod(K.E1, cand, K.p) == K.E2) leaked = cand;
-    check("leaking R for a single signature already gives away D", leaked == K.D);
+    cout << "\n==================== WHY IT WORKS ====================\n";
+    // from S2 = (M - D*S1)*R^-1 we get   R*S2 + D*S1 = M  (mod p-1)
+    // raise E1 to both sides :  E1^(R*S2) * E1^(D*S1) = E1^M
+    //                           S1^S2     * E2^S1     = E1^M      <- V2 == V1
+    i128 lhs = (R % n * (S2 % n) % n + D % n * (S1 % n) % n) % n;
+    cout << "R*S2 + D*S1 mod (p-1) = " << lhs << "\n";
+    cout << "M           mod (p-1) = " << M % n << "\n";
+    cout << "Raise E1 to both sides : S1^S2 * E2^S1 = E1^M , which is exactly V2 = V1.\n";
 
-    summary();
-    return failed != 0;
+    cout << "\n==================== TAMPER TESTS ====================\n";
+    i128 Mbad = M + 1;                                       // message changed
+    cout << "message changed to " << Mbad << " : V1 = " << mod_pow(E1, Mbad, p) << " , V2 = " << V2
+         << (mod_pow(E1, Mbad, p) == V2 ? "  -> VALID\n" : "  -> INVALID (caught)\n");
+
+    i128 W2 = mod_pow(E2, S1, p) * mod_pow(S1, S2 + 1, p) % p;   // signature changed
+    cout << "S2 changed to S2+1 : V1 = " << V1 << " , V2 = " << W2
+         << (V1 == W2 ? "  -> VALID\n" : "  -> INVALID (caught)\n");
+
+    i128 E2other = mod_pow(E1, D + 1, p);                     // somebody else's key
+    i128 W3 = mod_pow(E2other, S1, p) * mod_pow(S1, S2, p) % p;
+    cout << "checked with a different public key : V1 = " << V1 << " , V2 = " << W3
+         << (V1 == W3 ? "  -> VALID\n" : "  -> INVALID (caught)\n");
+    return 0;
 }

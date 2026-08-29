@@ -1,137 +1,127 @@
-# ElGamal Lab Toolkit — file index & cheat sheet
+# ElGamal Lab — file index & cheat sheet
 
-Five self-contained `.cpp` files. Each one compiles and runs alone (no shared
-headers, no build system) — pick the file matching the task you're handed,
-tweak the prime size or the message, done.
+Five short self-contained `.cpp` files. No structs, no classes — just
+`mod_pow`, `egcd`, `mod_inv`, four key-generation helpers, and a `main()` that
+prints every step with the formula beside it.
 
 ```
-g++ -O2 -std=c++17 -o run elgamal_vX_whatever.cpp && ./run [seed]
+g++ -O2 -o eg1 elgamal_v1_basic.cpp && ./eg1
+./eg1 2103021          # optional seed -> your own key pair
 ```
 
-Every file takes an optional integer seed so a run is reproducible, and every
-file ends with a `N passed, 0 failed` line and a non-zero exit code if anything
-broke. Needs GCC or Clang — `__int128` is a compiler extension, MSVC's `cl.exe`
-does not have it. MinGW g++ 15.2 confirmed working here.
+Needs GCC or Clang — `__int128` is a compiler extension, MSVC's `cl.exe` does
+not have it. MinGW g++ confirmed working. Each run takes about 25 ms.
 
-## Naming: theory sheet -> code
+## The formulas
 
-The variable names come straight off the lab theory sheet, not from the
-textbook-agnostic `(g, x, y)` notation.
+```
+Bob      p prime,  D = private key,  E1 = primitive root,  E2 = E1^D mod p
+         public key = (E1, E2, p)          private key = D
 
-| Theory sheet | Code | What it is |
+Encrypt  C1 = E1^R mod p                   C2 = (PT * E2^R) mod p
+Decrypt  PT = [C2 * (C1^D)^-1] mod p       (or PT = C2 * C1^(p-1-D) mod p)
+
+Sign     S1 = E1^R mod p                   S2 = (M - D*S1) * R^-1 mod (p-1)
+Verify   V1 = E1^M mod p                   V2 = (E2^S1 * S1^S2) mod p
+         valid  <=>  V1 == V2
+```
+
+Names are exactly the ones on the theory sheet: `p, D, E1, E2, R, PT, C1, C2,
+S1, S2, V1, V2`.
+
+## Key generation (in every file, printed step by step)
+
+Nothing is hardcoded — the key is really generated, following Bob's five steps:
+
+| Step | What happens | Function |
 |---|---|---|
-| `p` | `K.p` | large prime |
-| `D` | `K.D` | decryption key = **private key** |
-| `E1` | `K.E1` | 2nd part of the encryption key, a primitive root of `p` |
-| `E2 = E1^D mod p` | `K.E2` | 3rd part of the encryption key |
-| public key `(E1, E2, p)` | `Key` | what Bob publishes |
-| private key `D` | `K.D` | what Bob keeps |
-| `R` | `R` | fresh random integer, one per encryption |
-| cipher text `(C1, C2)` | `Cipher` | what goes on the wire |
-| signature `(S1, S2)` | `Sig` | file 4 only |
-| verification `(V1, V2)` | local vars | file 4 only |
+| 1 | pick a random 18-digit odd start, walk up to the first **safe prime** `p = 2q+1` (both `p` and `q` tested prime) | `next_safe_prime`, `is_prime` |
+| 2 | draw `D` at random from `[2, p-2]` | `rand_range` |
+| 3 | find the smallest **primitive root** `E1` | `find_primitive_root` |
+| 4 | compute `E2 = E1^D mod p` | `mod_pow` |
+| 5 | publish `(E1, E2, p)`, keep `D` | — |
 
+`R` is drawn fresh for every message the same way. In the signature file `R`
+also has to satisfy `gcd(R, p-1) = 1`, so `pick_R` keeps trying odd values
+until it does.
+
+Two shortcuts worth knowing, both printed by the programs:
+
+- **Why a safe prime?** With `p = 2q+1` an element can only have order 1, 2,
+  `q` or `2q`. So `g` is a primitive root the moment `g^2 != 1` and `g^q != 1`
+  — a two-line test instead of factoring `p-1`.
+- **Miller-Rabin** with the 12 bases `2..37` is *exact* for every `n` below
+  `3 * 10^24`, and our `p` is about `10^18`, so the "probable prime" answer is
+  actually a proof here.
+
+The seed is the only thing that fixes the key. Same seed → same key every run
+(good for a lab report); `./eg1 <your roll number>` → your own key pair.
+
+## Where the inputs are
+
+One block at the top of `main()` in every file:
+
+```cpp
+// ---------------- INPUT ----------------
+unsigned long long SEED = 2026;    // different seed -> different key pair
+i128 PT = 987654321;               // plain text, must be < p
 ```
-Bob      p prime, D private, E1 primitive root, E2 = E1^D mod p
-Encrypt  C1 = E1^R mod p            C2 = (PT * E2^R) mod p
-Decrypt  PT = [C2 * (C1^D)^-1] mod p        (or C2 * C1^(p-1-D), Fermat)
-Sign     S1 = E1^R mod p            S2 = (M - D*S1) * R^-1 mod (p-1)
-Verify   V1 = E1^M mod p            V2 = E2^S1 * S1^S2 mod p     accept iff V1 == V2
-```
+
+## Why `__int128`
+
+The generated `p` is about `10^18`. Inside `mod_pow` the line `a = a * a % m`
+needs `10^36`, and `long long` stops at `9.2 * 10^18` — it would silently wrap
+and decryption would return the wrong number.
+
+| Problem | Fix |
+|---|---|
+| `a * a` overflows `long long` | everything is `typedef __int128 i128` |
+| `cout` cannot print `__int128` | one `operator<<` that peels off digits |
+| `M - D*S1` goes negative | `((x % n) + n) % n` before using it |
+
+Same arithmetic, wider type. Nothing else changes.
 
 ## Which file for which task
 
 | If the task says... | Open |
 |---|---|
-| "implement ElGamal", "encrypt/decrypt a message" | `elgamal_v1_basic.cpp` |
-| "show the p=11 book example" | `elgamal_v1_basic.cpp` block `[0]` |
-| "decrypt without extended Euclid" | `elgamal_v1_basic.cpp` block `[4]` |
-| "why is the same plaintext encrypted differently every time" | `elgamal_v1_basic.cpp` block `[5]` |
-| "homomorphic property", "product cipher", "multiply two ciphertexts" | `elgamal_v2_product_cipher.cpp` |
-| "malleability", "change the amount without the key" | `elgamal_v2_product_cipher.cpp` block `[5]` |
-| "re-randomisation", "refresh a ciphertext", "mix-net", "e-voting" | `elgamal_v3_rerandomization.cpp` |
-| "digital signature", "verify authenticity", "detect tampering" | `elgamal_v4_signature.cpp` |
-| "what if the random R is reused" | `elgamal_v4_signature.cpp` block `[5]` |
-| "forge a signature without the private key" | `elgamal_v4_signature.cpp` block `[6]` |
-| "chosen-ciphertext attack", "decryption oracle" | `elgamal_v5_variations.cpp` block `[A]` |
-| "what does the ciphertext leak about the plaintext" | `elgamal_v5_variations.cpp` block `[C]` |
-| "solve the discrete log", "break a small key" | `elgamal_v5_variations.cpp` block `[D]` |
-| "why must E1 be a primitive root" | `elgamal_v5_variations.cpp` block `[E]` |
-| "encrypt a long string" | `elgamal_v5_variations.cpp` block `[G]` |
+| "implement ElGamal", "encrypt / decrypt" | `elgamal_v1_basic.cpp` |
+| "generate the keys", "find a primitive root" | any file — the block is identical |
+| "show the p = 11 book example" | `elgamal_v1_basic.cpp`, last block |
+| "decrypt without extended Euclid" | `elgamal_v1_basic.cpp`, "WHY IT WORKS" |
+| "product cipher", "homomorphic", "multiply two ciphers" | `elgamal_v2_product_cipher.cpp` |
+| "change the amount without the key", "malleability" | `elgamal_v2_product_cipher.cpp`, last block |
+| "re-randomization", "mix-net", "e-voting" | `elgamal_v3_rerandomization.cpp` |
+| "digital signature", "verify", "detect tampering" | `elgamal_v4_signature.cpp` |
+| any attack question | `elgamal_v5_variations.cpp` |
 
-## Why 128-bit, and what it cost
+`elgamal_v1_basic.cpp` ends by running the same functions on the theory-sheet
+numbers (`p = 11, D = 3, E1 = 2, PT = 7, R = 4`) and printing `E2 = 8`, cipher
+`(5, 6)`, `(C1^D)^-1 = 3`, `PT = 7` — matching the handwritten pages line for
+line. (`11 = 2*5 + 1` is a safe prime and `2` is a primitive root of it, so the
+generator above would have accepted this key too.)
 
-Default prime is a **100-bit safe prime** `p = 2q+1` (30 decimal digits). Three
-consequences the 64-bit version did not have to deal with:
+## Variations that get asked
 
-| Problem | Fix in these files |
-|---|---|
-| `cout` cannot print `__int128` | `toStr()` + an `operator<<` overload |
-| `a * b` overflows `u128` when `p > 64` bits (`p*p` needs 200 bits) | `mulmod()` by repeated doubling — additions only, never a product wider than `p` |
-| `long long` goes negative in `(M - D*S1)` | `submod()`, and `i128` used **only** inside `egcd` where coefficients are genuinely signed |
-| a random 100-bit prime is not findable by trial division | Miller-Rabin (`isPrime`), 12 fixed bases + 8 random ones |
-| `p-1` with small factors makes the discrete log easy | `safePrime()` returns `p = 2q+1` with `q` prime, so the only subgroup orders are 1, 2, q, 2q |
+Blocks **[A]**–**[F]** are all inside `elgamal_v5_variations.cpp` and print
+their own working.
 
-`mulmod` is what makes the whole thing work — everything else is ordinary
-modular arithmetic on a wider type.
+| # | Question | Answer |
+|---|---|---|
+| A | "What if the same `R` is used for two messages?" | `C1` repeats, and `C2b/C2a = PT2/PT1`. One known plain text gives the other. |
+| B | "What if the same `R` signs two messages?" | `R = (M1-M2)(S2a-S2b)^-1`, then `D = (M1-R*S2a)*S1^-1`, both mod `p-1`. Private key gone. |
+| C | "What if Bob decrypts anything except the target?" | Send `(C1, k*C2)`, get `k*PT` back, divide by `k`. |
+| D | "What if `p` is small?" | Generate a small key the same way, then loop `d = 1..p-1` until `E1^d == E2`. Instant at `p = 467`. |
+| E | "Does the cipher leak anything?" | Yes — `legendre(C2) = legendre(PT) * legendre(C1)^(D mod 2)`, and `D mod 2` is readable from the public `E2`. One bit of every plain text. |
+| F | "`R = 0`? `PT = 0`? `PT >= p`?" | `R=0` sends `PT` in the clear, `PT=0` forces `C2=0`, `PT>=p` comes back as `PT mod p`. |
 
-## Variations worth rehearsing
+Ones with no code, worth remembering:
 
-Grouped by how the question usually gets phrased. The ones marked **[code]**
-already run in one of these files.
-
-**Change one line of the algorithm**
-
-1. Decrypt with `C2 * C1^(p-1-D)` instead of inverting `C1^D`. Same answer, no
-   extended Euclid — Fermat gives the inverse for free. **[code: v1 `[4]`]**
-2. Encrypt with `R = 0`. Then `C1 = 1` and `C2 = PT`: the plaintext ships in the
-   clear. **[code: v1 `[6]`]**
-3. Encrypt `PT = 0`. `C2 = 0` no matter what `R` is, so the ciphertext announces
-   its own plaintext. **[code: v5 `[F]`]**
-4. Encrypt `PT >= p`. It silently comes back as `PT mod p`. **[code: v1 `[6]`]**
-5. Use `E1 = p-1` (order 2 instead of order `p-1`). `C1` only ever takes two
-   values, so two guesses decrypt anything. **[code: v5 `[E]`]**
-
-**Give the attacker one extra thing**
-
-6. Same `R` for two encryptions. `C1` repeats, and `C2b/C2a = PT2/PT1`, so one
-   known plaintext hands over the other. **[code: v5 `[B]`]**
-7. Same `R` for two *signatures*. `R = (Ma-Mb)/(S2a-S2b) mod (p-1)`, then
-   `D = (Ma - R*S2a)/S1 mod (p-1)`. Full private-key recovery — the PS3 bug.
-   **[code: v4 `[5]`]**
-8. Leak `R` for a single signature. One line and `D` is gone. **[code: v4 `[7]`]**
-9. Give Eve a decryption oracle that refuses only the target cipher. She sends
-   `(C1, k*C2)`, gets `k*PT` back, divides by `k`. **[code: v5 `[A]`]**
-10. Give Eve `p` small enough. Baby-step giant-step recovers `D` from `E2` in
-    `sqrt(p)` steps. **[code: v5 `[D]`]**
-
-**Attack with nothing but the public key**
-
-11. Malleability: multiply `C2` by `k` and the payment 100 becomes 100k. Nobody
-    notices, because there is nothing to notice with. **[code: v2 `[5]`]**
-12. Product cipher: multiply two ciphers componentwise, get a valid cipher of
-    `PT1*PT2`. Same maths as 11, framed as a feature. **[code: v2 `[3]`]**
-13. Re-randomise: `(C1*E1^R', C2*E2^R')` is a fresh-looking cipher for the same
-    plaintext. Public key only. **[code: v3 `[3]`]**
-14. Legendre leak: `legendre(PT) = legendre(C2) * legendre(C1)^(D mod 2)`, and
-    `D mod 2` is readable off the public `E2`. One bit of every plaintext, for
-    free. Fix: square the message into the order-`q` subgroup first, and take
-    the root back with `y^((p+1)/4)` since `p = 3 mod 4`. **[code: v5 `[C]`]**
-15. Existential forgery on unhashed signatures: pick `a`, `b`, set
-    `S1 = E1^a * E2^b`, `S2 = -S1*b^-1 mod (p-1)`, `M = a*S2 mod (p-1)`.
-    Verifies against Alice's public key. Eve does not get to pick `M` — which is
-    exactly why hashing kills it. **[code: v4 `[6]`]**
-
-**Trick questions with no code**
-
-16. "Signature on `M` also verifies `M + (p-1)`" — because `E1^M` only ever sees
-    the exponent mod `p-1`. **[code: v4 `[3]`]**
-17. "Why must `gcd(R, p-1) = 1` when signing but not when encrypting?" —
-    signing inverts `R` mod `p-1`; encryption only exponentiates by it.
-18. "Ciphertext is twice the plaintext length" — `(C1, C2)` are both mod `p`.
-    That is ElGamal's standing cost versus RSA.
-19. "Is ElGamal CPA-secure? CCA-secure?" — CPA yes (under DDH, *in the QR
-    subgroup*), CCA no, and 9/11 above are the proof.
-20. "Which part is Diffie-Hellman?" — `(E1^R, E2^R)` is exactly a DH exchange;
-    `C2` is the plaintext masked by the shared secret. Encrypting `PT = 1`
-    makes the DH pair visible on its own. **[code: v5 `[F]`]**
+- A signature on `M` also verifies `M + (p-1)`, because `E1^M` only sees the
+  exponent mod `p-1`.
+- `gcd(R, p-1) = 1` is needed for **signing** (we invert `R` mod `p-1`) but not
+  for encryption (we only raise to the power `R`).
+- The cipher text is twice the length of the plain text — `(C1, C2)` are both
+  mod `p`. That is ElGamal's standing cost against RSA.
+- `(E1^R, E2^R)` is exactly a Diffie-Hellman exchange; `C2` is just the plain
+  text masked by the shared secret.

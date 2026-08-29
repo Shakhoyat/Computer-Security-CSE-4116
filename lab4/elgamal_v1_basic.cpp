@@ -1,228 +1,176 @@
-// ElGamal cryptosystem, file 1: key generation, encryption, decryption.
-//   0 the theory-sheet example verbatim   p=11 D=3 E1=2 E2=8 PT=7 R=4 -> (5,6)
-//   1 the same five steps on a 100-bit safe prime
-//   2 decryption two ways: (C1^D)^-1  and  C1^(p-1-D)   [Fermat, no ext-Euclid]
-//   3 fresh R every time -> same PT gives a different cipher on every run
-//   4 the range rules: PT must be < p, R = 0 leaks the plaintext
-// Naming follows the theory sheet exactly:
-//   p large prime | D private/decryption key | E1 primitive root | E2 = E1^D mod p
-//   public key = (E1, E2, p)   private key = D   cipher text = (C1, C2)
-// Build: g++ -O2 -std=c++17 -o eg1 elgamal_v1_basic.cpp   Run: ./eg1 [seed]
+// ElGamal Cryptosystem - Key generation, Encryption, Decryption
+//
+//   Bob    : p = large prime, D = private key, E1 = primitive root, E2 = E1^D mod p
+//            public key = (E1, E2, p)          private key = D
+//   Alice  : C1 = E1^R mod p                   C2 = (PT * E2^R) mod p
+//   Bob    : PT = [C2 * (C1^D)^-1] mod p
+//
+// The key is really generated here : a prime is searched for and tested, the
+// primitive root is found and checked, D and R are drawn at random.
+// __int128 is needed because p is about 10^18, so a*a % p needs 10^36.
+//
+// build : g++ -O2 -o eg1 elgamal_v1_basic.cpp        run : ./eg1
 #include <bits/stdc++.h>
 using namespace std;
+typedef __int128 i128;
 
-// ---------- 128-bit modular core (identical in every lab4 file) ----------
-typedef unsigned long long u64;
-typedef unsigned __int128  u128;   // p, E1, E2, D, R, C1, C2 all outgrow 64 bits
-typedef __int128           i128;   // egcd only: its coefficients go negative
-
-string toStr(u128 x) {             // cout has no idea what __int128 is
-    if (!x) return "0";
+ostream& operator<<(ostream& os, i128 x) {          // cout does not know __int128
+    if (x == 0) return os << '0';
     string s;
-    while (x) { s += char('0' + int(x % 10)); x /= 10; }
+    while (x > 0) { s += char('0' + (int)(x % 10)); x /= 10; }
     reverse(s.begin(), s.end());
-    return s;
+    return os << s;
 }
-ostream &operator<<(ostream &os, u128 x) { return os << toStr(x); }
-int digitCount(u128 x) { return (int)toStr(x).size(); }
-int bitLen(u128 x) { int b = 0; while (x) { b++; x >>= 1; } return b; }
-
-// a*b overflows u128 as soon as p passes 64 bits, so multiply by repeated
-// doubling: O(log b) additions, never a value wider than the modulus.
-u128 mulmod(u128 a, u128 b, u128 m) {
-    a %= m; b %= m; u128 r = 0;
-    while (b) { if (b & 1) { r += a; if (r >= m) r -= m; } a <<= 1; if (a >= m) a -= m; b >>= 1; }
+i128 mod_pow(i128 a, i128 e, i128 m) {              // a^e mod m
+    i128 r = 1; a %= m;
+    while (e > 0) {
+        if (e & 1) r = r * a % m;                   // <-- needs __int128
+        a = a * a % m;
+        e >>= 1;
+    }
     return r;
 }
-u128 powmod(u128 a, u128 e, u128 m) {          // square-and-multiply
-    u128 r = 1; a %= m;
-    while (e) { if (e & 1) r = mulmod(r, a, m); a = mulmod(a, a, m); e >>= 1; }
-    return r;
-}
-u128 gcdu(u128 a, u128 b) { while (b) { u128 t = a % b; a = b; b = t; } return a; }
-i128 egcd(i128 a, i128 b, i128 &x, i128 &y) {
-    if (!b) { x = 1; y = 0; return a; }
+i128 egcd(i128 a, i128 b, i128 &x, i128 &y) {       // a*x + b*y = gcd(a,b)
+    if (b == 0) { x = 1; y = 0; return a; }
     i128 x1, y1, g = egcd(b, a % b, x1, y1);
     x = y1; y = x1 - (a / b) * y1;
     return g;
 }
-u128 inverse(u128 a, u128 m) {                 // a^-1 mod m, assumes gcd(a,m)=1
-    i128 x, y; egcd((i128)(a % m), (i128)m, x, y);
-    i128 r = x % (i128)m;
-    return (u128)(r < 0 ? r + (i128)m : r);
+i128 mod_inv(i128 a, i128 m) {                      // a^-1 mod m
+    i128 x, y; egcd(a % m, m, x, y);
+    return (x % m + m) % m;
 }
 
-u64 rngState;
-u64 nextRand() {                               // splitmix64
-    u64 z = (rngState += 0x9E3779B97F4A7C15ULL);
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
-    return z ^ (z >> 31);
+// ---------------- KEY GENERATION HELPERS ----------------
+mt19937_64 rng;
+i128 rand_range(i128 lo, i128 hi) {                 // random value in [lo, hi]
+    return lo + (i128)(rng() % (unsigned long long)(hi - lo + 1));
 }
-u128 rand128() { return ((u128)nextRand() << 64) | nextRand(); }
-u128 randRange(u128 lo, u128 hi) { return lo + rand128() % (hi - lo + 1); }   // inclusive
-
-bool isPrime(u128 n) {                         // Miller-Rabin
+bool is_prime(i128 n) {                             // Miller-Rabin, exact below 3*10^24
     if (n < 2) return false;
-    for (u64 d = 2; d < 1000; d += (d == 2 ? 1 : 2))
-        if (n % d == 0) return n == d;         // cheap trial-division sieve first
-    u128 d = n - 1; int r = 0;
-    while (!(d & 1)) { d >>= 1; r++; }
-    auto composite = [&](u128 a) {             // true if a witnesses n composite
-        u128 x = powmod(a, d, n);
-        if (x == 1 || x == n - 1) return false;
-        for (int i = 1; i < r; i++) { x = mulmod(x, x, n); if (x == n - 1) return false; }
-        return true;
-    };
-    for (u64 a : {2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37})
-        if (composite(a)) return false;        // this base set alone is exact below 3.3e24
-    for (int i = 0; i < 8; i++)                // random bases past that: error < 4^-8
-        if (composite(randRange(2, n - 2))) return false;
+    for (i128 q : {2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37})
+        if (n % q == 0) return n == q;
+    i128 d = n - 1; int r = 0;
+    while (d % 2 == 0) { d /= 2; r++; }
+    for (i128 a : {2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37}) {
+        i128 x = mod_pow(a, d, n);
+        if (x == 1 || x == n - 1) continue;
+        bool composite = true;
+        for (int i = 1; i < r; i++) { x = x * x % n; if (x == n - 1) { composite = false; break; } }
+        if (composite) return false;
+    }
     return true;
 }
-u128 randBits(int bits) {                      // odd, exactly `bits` long
-    u128 x = rand128() & ((((u128)1) << bits) - 1);
-    return x | (((u128)1) << (bits - 1)) | 1;
+// A safe prime is p = 2q+1 with q prime too. Then an element can only have
+// order 1, 2, q or 2q, so testing for a primitive root takes just two lines.
+i128 next_safe_prime(i128 start) {
+    i128 p = start | 1;                             // start from an odd number
+    while (!(is_prime(p) && is_prime((p - 1) / 2))) p += 2;
+    return p;
 }
-// safe prime p = 2q+1: the only subgroup orders are 1, 2, q, 2q, so there is
-// nowhere small for an attacker to push the discrete log into (Pohlig-Hellman)
-u128 safePrime(int bits) {
-    while (true) {
-        u128 q = randBits(bits - 1);
-        if (!isPrime(q)) continue;
-        u128 p = 2 * q + 1;
-        if (isPrime(p)) return p;
-    }
+i128 find_primitive_root(i128 p) {                  // smallest g of full order p-1
+    i128 q = (p - 1) / 2;
+    for (i128 g = 2; ; g++)
+        if (mod_pow(g, 2, p) != 1 && mod_pow(g, q, p) != 1) return g;
 }
-// with p = 2q+1, g is a primitive root iff g^2 != 1 and g^q != 1
-u128 primitiveRoot(u128 p, u128 q) {
-    for (u128 g = 2;; g++)
-        if (powmod(g, 2, p) != 1 && powmod(g, q, p) != 1) return g;
-}
-
-// ---------- ElGamal, named as on the theory sheet ----------
-struct Key {
-    u128 p;      // 1. large prime
-    u128 D;      // 2. decryption / private key
-    u128 E1;     // 3. 2nd part of the encryption / public key (primitive root of p)
-    u128 E2;     // 4. 3rd part of the public key: E2 = E1^D mod p
-    u128 q;      // (p-1)/2, kept around so R can be drawn safely
-};
-struct Cipher { u128 C1, C2; };
-
-Key keyGen(int bits) {                         // Bob's five steps
-    Key K;
-    K.p  = safePrime(bits);
-    K.q  = (K.p - 1) / 2;
-    K.E1 = primitiveRoot(K.p, K.q);
-    K.D  = randRange(2, K.p - 3);              // 1 <= D <= p-2
-    K.E2 = powmod(K.E1, K.D, K.p);             // E2 = E1^D mod p
-    return K;
-}
-u128 pickR(const Key &K) { return randRange(2, K.p - 3); }
-
-Cipher encrypt(u128 PT, u128 R, const Key &K) {
-    Cipher C;
-    C.C1 = powmod(K.E1, R, K.p);                        // C1 = E1^R mod p
-    C.C2 = mulmod(PT % K.p, powmod(K.E2, R, K.p), K.p); // C2 = PT * E2^R mod p
-    return C;
-}
-u128 decrypt(const Cipher &C, const Key &K) {           // PT = [C2 * (C1^D)^-1] mod p
-    u128 s = powmod(C.C1, K.D, K.p);
-    return mulmod(C.C2, inverse(s, K.p), K.p);
-}
-u128 decryptFermat(const Cipher &C, const Key &K) {     // PT = C2 * C1^(p-1-D) mod p
-    return mulmod(C.C2, powmod(C.C1, K.p - 1 - K.D, K.p), K.p);
-}
-
-// ---------- tiny test harness ----------
-int passed = 0, failed = 0;
-void check(const string &what, bool ok, bool expect = true) {
-    bool pass = (ok == expect);
-    pass ? passed++ : failed++;
-    cout << "    [" << (pass ? "OK  " : "FAIL") << "] " << what;
-    if (!pass) cout << "  (expected " << (expect ? "true" : "false") << ")";
-    cout << "\n";
-}
-void summary() { cout << "\n==== " << passed << " passed, " << failed << " failed ====\n"; }
 
 int main(int argc, char **argv) {
-    rngState = (argc > 1) ? strtoull(argv[1], 0, 10) : 20260829ULL;
-    u64 seed = rngState;
+    // ---------------- INPUT (change only these two) ----------------
+    unsigned long long SEED = 2026;    // different seed -> different key pair
+    i128 PT = 987654321;               // plain text, must be < p
+    if (argc > 1) SEED = strtoull(argv[1], 0, 10);   // ./eg1 2103021 -> your own key
+    rng.seed(SEED);
 
-    cout << "[0] THE THEORY-SHEET EXAMPLE, STEP FOR STEP\n";
-    {
-        Key T; T.p = 11; T.D = 3; T.E1 = 2; T.q = 5;
-        T.E2 = powmod(T.E1, T.D, T.p);
-        cout << "    Bob: p=" << T.p << "  D=" << T.D << "  E1=" << T.E1
-             << "  E2 = E1^D mod p = " << T.E2 << "\n";
-        cout << "    public key (E1,E2,p) = (" << T.E1 << "," << T.E2 << "," << T.p
-             << ")   private key D = " << T.D << "\n";
-        u128 PT = 7, R = 4;
-        Cipher C = encrypt(PT, R, T);
-        cout << "    Alice: PT=" << PT << "  R=" << R
-             << "  ->  C1 = E1^R = " << C.C1 << "   C2 = PT*E2^R = " << C.C2 << "\n";
-        check("cipher is (5,6), matching the hand calculation", C.C1 == 5 && C.C2 == 6);
-        u128 s = powmod(C.C1, T.D, T.p);
-        cout << "    Bob:   C1^D = " << s << "   (C1^D)^-1 = " << inverse(s, T.p)
-             << "   PT = C2*(C1^D)^-1 = " << decrypt(C, T) << "\n";
-        check("decryption returns 7", decrypt(C, T) == PT);
-    }
+    cout << "==================== KEY GENERATION (Bob) ====================\n";
+    cout << "Step 1 : select a large prime p\n";
+    i128 start = rand_range((i128)100000000000000000, (i128)900000000000000000);
+    i128 p = next_safe_prime(start);
+    i128 q = (p - 1) / 2;
+    cout << "         search upward from    " << start << "\n";
+    cout << "         p = " << p << "\n";
+    cout << "         is_prime(p)      = " << (is_prime(p) ? "yes" : "no") << "\n";
+    cout << "         q = (p-1)/2      = " << q << "\n";
+    cout << "         is_prime(q)      = " << (is_prime(q) ? "yes" : "no")
+         << "   -> p is a safe prime\n";
 
-    cout << "\n[1] KEY GENERATION ON A 100-BIT SAFE PRIME (seed " << seed << ")\n";
-    Key K = keyGen(100);
-    cout << "    p  = " << K.p << "   (" << digitCount(K.p) << " digits, " << bitLen(K.p) << " bits)\n";
-    cout << "    q  = (p-1)/2 = " << K.q << "\n";
-    cout << "    E1 = " << K.E1 << "   (primitive root of p)\n";
-    cout << "    D  = " << K.D << "\n";
-    cout << "    E2 = " << K.E2 << "\n";
-    check("p is prime", isPrime(K.p));
-    check("q = (p-1)/2 is prime, so p is a safe prime", isPrime(K.q));
-    check("E1^(p-1) = 1 mod p  (Fermat)", powmod(K.E1, K.p - 1, K.p) == 1);
-    check("E1 has full order p-1, not q", powmod(K.E1, K.q, K.p) != 1);
-    // this product is what kills 64-bit code: p ~ 2^100, so p*p ~ 2^200
-    cout << "    note: p*p would need " << 2 * bitLen(K.p)
-         << " bits -- that is why every multiply goes through mulmod()\n";
+    cout << "Step 2 : select the private / decryption key D, random in [2, p-2]\n";
+    i128 D = rand_range(2, p - 2);
+    cout << "         D = " << D << "\n";
 
-    cout << "\n[2] ENCRYPTION   C1 = E1^R mod p,  C2 = PT * E2^R mod p\n";
-    u128 PT = 0;
-    for (unsigned char c : string("Ashik-2k21")) PT = PT * 256 + c;   // pack text into one number
-    PT %= K.p;
-    u128 R = pickR(K);
-    Cipher C = encrypt(PT, R, K);
-    cout << "    PT = " << PT << "\n    R  = " << R << "\n";
-    cout << "    C1 = " << C.C1 << "\n    C2 = " << C.C2 << "\n";
-    check("PT < p, so nothing wraps", PT < K.p);
+    cout << "Step 3 : select E1, a primitive root of p\n";
+    i128 E1 = find_primitive_root(p);
+    cout << "         E1 = " << E1 << "\n";
+    cout << "         E1^2 mod p     = " << mod_pow(E1, 2, p) << "   (not 1, good)\n";
+    cout << "         E1^q mod p     = " << mod_pow(E1, q, p) << "   (not 1, good)\n";
+    cout << "         E1^(p-1) mod p = " << mod_pow(E1, p - 1, p) << "   (Fermat, must be 1)\n";
 
-    cout << "\n[3] DECRYPTION   PT = [C2 * (C1^D)^-1] mod p\n";
-    cout << "    recovered = " << decrypt(C, K) << "\n";
-    check("Bob recovers PT", decrypt(C, K) == PT);
-    // why it works: C1^D = (E1^R)^D = (E1^D)^R = E2^R, the exact mask C2 carries
-    check("C1^D == E2^R   (same mask, reached from either side)",
-          powmod(C.C1, K.D, K.p) == powmod(K.E2, R, K.p));
-    Key wrong = K; wrong.D = K.D + 1;
-    check("a wrong D gives garbage", decrypt(C, wrong) == PT, false);
+    i128 E2 = mod_pow(E1, D, p);                          // E2 = E1^D mod p
+    cout << "Step 4 : E2 = E1^D mod p\n";
+    cout << "            = " << E1 << "^" << D << " mod " << p << "\n";
+    cout << "            = " << E2 << "\n";
 
-    cout << "\n[4] SAME THING WITHOUT EXTENDED EUCLID   PT = C2 * C1^(p-1-D) mod p\n";
-    // Fermat: C1^(p-1) = 1, so C1^(p-1-D) is already the inverse of C1^D
-    cout << "    recovered = " << decryptFermat(C, K) << "\n";
-    check("Fermat route agrees with the ext-Euclid route", decryptFermat(C, K) == decrypt(C, K));
+    cout << "Step 5 : public  key (E1, E2, p) = (" << E1 << ", " << E2 << ", " << p << ")\n";
+    cout << "         private key  D          = " << D << "\n";
 
-    cout << "\n[5] FRESH R EVERY TIME (this is what textbook RSA does not give you)\n";
-    Cipher a = encrypt(PT, pickR(K), K), b = encrypt(PT, pickR(K), K);
-    cout << "    run 1: (" << a.C1 << ", " << a.C2 << ")\n";
-    cout << "    run 2: (" << b.C1 << ", " << b.C2 << ")\n";
-    check("same PT, two ciphers that do not match", a.C1 == b.C1 && a.C2 == b.C2, false);
-    check("both still decrypt to PT", decrypt(a, K) == PT && decrypt(b, K) == PT);
+    cout << "\n==================== ENCRYPTION (Alice) ====================\n";
+    i128 R = rand_range(2, p - 2);                        // fresh random per message
+    cout << "Step 1 : plain text        PT = " << PT << "   (PT < p ? "
+         << (PT < p ? "yes" : "NO") << ")\n";
+    cout << "Step 2 : random integer    R  = " << R << "\n";
 
-    cout << "\n[6] THE RANGE RULES\n";
-    Cipher over = encrypt(PT + K.p, pickR(K), K);        // PT+p is congruent to PT
-    check("PT >= p comes back as sent", decrypt(over, K) == PT + K.p, false);
-    check("...it comes back as PT mod p instead", decrypt(over, K) == PT);
-    Cipher r0 = encrypt(PT, 0, K);                       // R=0 -> E1^0 = 1, E2^0 = 1
-    cout << "    R = 0 gives (C1,C2) = (" << r0.C1 << ", " << r0.C2 << ")\n";
-    check("R = 0 leaves the plaintext sitting in C2 in the clear", r0.C2 == PT);
+    i128 C1 = mod_pow(E1, R, p);                          // C1 = E1^R mod p
+    cout << "Step 3 : C1 = E1^R mod p\n";
+    cout << "            = " << E1 << "^" << R << " mod " << p << "\n";
+    cout << "            = " << C1 << "\n";
 
-    summary();
-    return failed != 0;
+    i128 mask = mod_pow(E2, R, p);                        // E2^R mod p
+    i128 C2 = PT % p * mask % p;                          // C2 = PT * E2^R mod p
+    cout << "Step 4 : C2 = (PT * E2^R) mod p\n";
+    cout << "         E2^R mod p = " << mask << "\n";
+    cout << "            = (" << PT << " * " << mask << ") mod " << p << "\n";
+    cout << "            = " << C2 << "\n";
+    cout << "Step 5 : cipher text (C1, C2) = (" << C1 << ", " << C2 << ")\n";
+
+    cout << "\n==================== DECRYPTION (Bob) ====================\n";
+    i128 s = mod_pow(C1, D, p);                           // C1^D mod p
+    cout << "Step 1 : C1^D mod p = " << C1 << "^" << D << " mod " << p << "\n";
+    cout << "                    = " << s << "\n";
+
+    i128 s_inv = mod_inv(s, p);                           // (C1^D)^-1 mod p
+    cout << "Step 2 : (C1^D)^-1 mod p = " << s_inv << "\n";
+    cout << "         check : " << s << " * " << s_inv << " mod p = " << s * s_inv % p << "\n";
+
+    i128 dec = C2 * s_inv % p;                            // PT = C2 * (C1^D)^-1 mod p
+    cout << "Step 3 : PT = [C2 * (C1^D)^-1] mod p\n";
+    cout << "            = (" << C2 << " * " << s_inv << ") mod " << p << "\n";
+    cout << "            = " << dec << "\n";
+
+    cout << "\nRESULT : sent = " << PT << " , recovered = " << dec
+         << (dec == PT ? "   -> MATCH\n" : "   -> MISMATCH\n");
+
+    cout << "\n==================== WHY IT WORKS ====================\n";
+    cout << "C1^D = (E1^R)^D = (E1^D)^R = E2^R , the same mask Alice used.\n";
+    cout << "   C1^D = " << s << "\n";
+    cout << "   E2^R = " << mask << "\n";
+    cout << "Dividing C2 by that mask leaves PT.\n";
+    i128 alt = C2 * mod_pow(C1, p - 1 - D, p) % p;        // Fermat short cut
+    cout << "Short cut without extended Euclid :\n";
+    cout << "   PT = C2 * C1^(p-1-D) mod p = " << alt << "\n";
+
+    cout << "\n==================== SAME CODE ON THE THEORY SHEET NUMBERS ====================\n";
+    // p = 11 is also a safe prime (q = 5) and 2 is a primitive root of it,
+    // so the generator above would accept this key as well.
+    i128 bp = 11, bD = 3, bE1 = 2, bPT = 7, bR = 4;
+    i128 bE2 = mod_pow(bE1, bD, bp);
+    i128 bC1 = mod_pow(bE1, bR, bp);
+    i128 bC2 = bPT * mod_pow(bE2, bR, bp) % bp;
+    i128 bs  = mod_pow(bC1, bD, bp);
+    cout << "p = " << bp << " , D = " << bD << " , E1 = " << bE1 << "\n";
+    cout << "E2 = E1^D mod p          = " << bE2 << "        public key (2, 8, 11)\n";
+    cout << "C1 = E1^R mod p          = " << bC1 << "        (R = " << bR << ")\n";
+    cout << "C2 = (PT * E2^R) mod p   = " << bC2 << "        cipher = (" << bC1 << ", " << bC2 << ")\n";
+    cout << "C1^D mod p               = " << bs << "\n";
+    cout << "(C1^D)^-1 mod p          = " << mod_inv(bs, bp) << "\n";
+    cout << "PT = [C2*(C1^D)^-1] mod p = " << bC2 * mod_inv(bs, bp) % bp << "\n";
+    return 0;
 }
